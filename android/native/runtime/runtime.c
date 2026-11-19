@@ -1,4 +1,4 @@
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__OHOS__)
 #include <android/log.h>
 #endif
 #include "runtime.h"
@@ -37,13 +37,14 @@ void s2a_det_init(void);
 void load_modules(const char *, const char **, int);
 void load_modules_from_source(const struct s2a_loader_source *, const char **, int);
 void s2a_caps_apply(const char *);   // runtime/src/caps.c
+const char *s2a_module_dir(void);   // runtime/src/loader.c
 void s2a_fps_start(const char *);    // runtime/src/fps.c
 void s2a_ql_boot_mode(int docked);   // runtime/src/qladder_host.c
 unsigned s2a_unresolved_count(void);
 uint64_t s2a_mem_init(const char *);
 int s2a_npdm_ounce(const char *);   // runtime/src/svc_mem.c：装模块前认 Switch 2（1 / 0，读不到 −1）
 void *guest_sym(const char *);
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__OHOS__)
 // 同一 DSO 的私有 os.c 接缝，不扩展对外 native ABI。
 __attribute__((visibility("hidden"))) int s2a_android_session_log_start(const char *, uint64_t);
 #endif
@@ -131,7 +132,7 @@ static int run_common(const struct s2a_android_runtime_request *r,
     g_status.state = g_status.last_phase = S2A_RUNTIME_LOADING;
     pthread_mutex_unlock(&g_lock);
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__OHOS__)
     int log_error = s2a_android_session_log_start(r->services.state_dir, r->services.session_id);
     if (log_error) {
         char reason[128];
@@ -201,7 +202,7 @@ static int run_common(const struct s2a_android_runtime_request *r,
             frozen->mode == 1 ? "direct" : "generic", frozen->reason,
             frozen->counts.devices, frozen->counts.queues, frozen->counts.workers,
             frozen->counts.consumers);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__OHOS__)
         // 同一行也直接写系统日志：这时 stderr 还没被泵进 logcat，发布包上这一行只会在下一局
         // 以「prev|」回放出现（真机实测），按本局进程核对实际图形路径的工具在当局读不到它。
         __android_log_print(ANDROID_LOG_INFO, "S2Arm",
@@ -266,6 +267,11 @@ static int run_common(const struct s2a_android_runtime_request *r,
     else load_modules(r->module_dir, names, (int)count);
     if (s2a_unresolved_count()) return failed(S2A_RUNTIME_IMPORT, 0, "unresolved guest imports");
     if (stop_requested()) return failed(S2A_RUNTIME_STOP, 0, "stop after module loading");
+#if defined(__OHOS__)
+    // Same order as the Apple host (runtime/src/host_main.c): widen scanner here. The 60 FPS table
+    // starts below with the upstream call, after the VM writers are ready (O-2 merge: was started twice).
+    { void s2a_widen_start(void); s2a_widen_start(); }
+#endif
     // vk-direct 实验开关（direct_session.c）冻结后，托管侧按 s2a_gfx_mode()==1 关掉通用 GPU、
     // 装一个成员一律抛错的 direct 渲染器；这只有 Vulkan 客体成立（客体自己的 vk* 导入由直连
     // Vulkan 前端应答）。同一个组合遇上 NVN 客体时，既没有 NVN 直连表（选择器是 generic），
@@ -294,7 +300,12 @@ static int run_common(const struct s2a_android_runtime_request *r,
     // 档位梯子（#528 第 6 项）：读本机本款记下的帧率档，上限 = App 选的运行模式（console_mode 1 主机 / 0 掌机）。
     //   要在文档根绑好之后（ladder.txt 在 S2A_DOCS 下）；换档本身在直连上屏每帧（hle_nvn.c → s2a_qp_frame → s2a_ql_host_frame）
     s2a_ql_boot_mode(r->services.console_mode == 1);
+#if defined(__OHOS__)
+    // 鸿蒙出包把 fps.tsv 放在模块目录（<游戏>/ohos-<指纹>/fps.tsv，pack/targets/ohos），不在游戏数据根。
+    s2a_fps_start(r->module_dir ? r->module_dir : s2a_module_dir());
+#else
     s2a_fps_start(r->services.game_data_dir);
+#endif
     // 在执行任何 SDK 指令前解析全部必需入口。DT_INIT 仍由共享 loader 按逆依赖顺序遍历。
     static const char *const sdk[] = {"_init_libc0", "nnosInitialize", "_init_libc1",
         "nninitInitializeSdkModule", "nninitStartup", "_init_libc2", "nnMain"};
