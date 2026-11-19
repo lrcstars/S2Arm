@@ -324,6 +324,10 @@ struct nvn_gpu_cmd_s {
     uint32_t es_count[ES_KINDS];   // 实际录了几次（测试读数：nvn_gpu_vk_test_emit_counts）
     // 遮挡查询（nvn_gpu_cmd_desc.occlusion_slots > 0 才有）：一段一个查询池，段开头整池重置；每个槽一段里只能用一次
     VkQueryPool qpool; uint32_t qcount, qmax_used; int32_t q_active; uint8_t *q_used; uint8_t pass_occl;
+#define QX_PER_POOL 64u
+    // 查询续段：通道内反馈要断开 VkRenderPass，开着的查询不能跨通道，断开后在续段池里换一个新槽接着计，
+    // 完成时把续段的读数加回父槽（qx_parent）。qx 每池 QX_PER_POOL 槽、按需加池；qx_cur = 当前续段槽号 + 1（0 = 正在计的是 qpool 的父槽本身）
+    VkQueryPool *qx; uint32_t *qx_parent, nqx, qx_cur;
     struct nvn_gpu_cmd_s *live_next;
 };
 
@@ -1501,6 +1505,11 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
     if (status == NVN_GPU_DONE_OK && s->cmd && s->cmd->qpool && s->cmd->qmax_used && (occ = calloc(s->cmd->qcount, sizeof *occ))) {
         for (uint32_t i = 0; i < s->cmd->qmax_used; i++)
             if (s->cmd->q_used[i]) (void)vkGetQueryPoolResults(g.d, s->cmd->qpool, i, 1, sizeof *occ, &occ[i], sizeof *occ, VK_QUERY_RESULT_64_BIT);
+        for (uint32_t k = 0; k < s->cmd->nqx; k++) {   // 续段读数加回父槽（同一查询被反馈断通道切成几段，样本数相加）
+            uint64_t v = 0;
+            (void)vkGetQueryPoolResults(g.d, s->cmd->qx[k / QX_PER_POOL], k % QX_PER_POOL, 1, sizeof v, &v, sizeof v, VK_QUERY_RESULT_64_BIT);
+            occ[s->cmd->qx_parent[k]] += v;
+        }
         d.occlusion = occ; d.nocclusion = s->cmd->qcount;
     }
     nvn_gpu_timestamp_result timestamps[NVN_GPU_TIMESTAMP_SLOTS] = {{0}};
@@ -1606,6 +1615,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+    for (uint32_t i = 0; i < (c->nqx + QX_PER_POOL - 1) / QX_PER_POOL; i++) vkDestroyQueryPool(g.d, c->qx[i], NULL);
+    free(c->qx); free(c->qx_parent);
         seg_give_q(c->qpool, c->qcount);
     free(c->q_used);
     // 段内解码资源在 nvn_vk_bcdec.c 里销毁，那边的 vkDestroy* 不走两级回放的包装（不先清空录制队列）：
@@ -4790,11 +4801,51 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
 #undef PBP_STEP
 }
 
+// 遮挡查询的控制位：开关 debug.s2a.nvk_occl_fast（缺省 0 = 照能力位用 PRECISE 精确计数）：1 = 不带 PRECISE，走显卡的快速（可能非精确）计数。
+// 精确计数在部分移动 GPU 上要逐个样本过一遍，本款每帧 400 多个遮挡查询、全在热通道里；NVN 的语义要精确值，先用读数看差多少。
+static VkQueryControlFlags occl_flags(void) {
+    static int fast = -1;
+    if (fast < 0) fast = nvn_plat_flag("nvk_occl_fast", 0) != 0;
+    return g.dev->core_features.occlusionQueryPrecise && !fast ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
+}
+// 结束正在计的查询：父槽本身或它的续段槽
+static void occl_end(struct nvn_gpu_cmd_s *c) {
+    if (c->q_active < 0) return;
+    if (c->qx_cur) vkCmdEndQuery(c->cb, c->qx[(c->qx_cur - 1) / QX_PER_POOL], (c->qx_cur - 1) % QX_PER_POOL);
+    else vkCmdEndQuery(c->cb, c->qpool, (uint32_t)c->q_active);
+    c->q_active = -1; c->qx_cur = 0;
+}
+// 续段第一步（通道外调用）：给父槽 parent 取一个续段槽并重置；返回槽号 + 1，0 = 失败（已置 sticky）
+static uint32_t occl_split_reserve(struct nvn_gpu_cmd_s *c, int32_t parent) {
+    uint32_t k = c->nqx;
+    if (k % QX_PER_POOL == 0) {   // 当前池满（或还没有池）：加一个池，父槽表一起扩
+        VkQueryPool *qx = realloc(c->qx, (k / QX_PER_POOL + 1) * sizeof *qx);
+        if (!qx) { set_sticky(c, NVN_GPU_E_OOM, "遮挡查询续段池表分配失败"); return 0; }
+        c->qx = qx;
+        uint32_t *pp = realloc(c->qx_parent, (k + QX_PER_POOL) * sizeof *pp);
+        if (!pp) { set_sticky(c, NVN_GPU_E_OOM, "遮挡查询续段父槽表分配失败"); return 0; }
+        c->qx_parent = pp;
+        VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = QX_PER_POOL;
+        if (vkCreateQueryPool(g.d, &qi, NULL, &c->qx[k / QX_PER_POOL]) != VK_SUCCESS) {
+            set_sticky(c, NVN_GPU_E_OOM, "遮挡查询续段池（%u 槽）创建失败", QX_PER_POOL); return 0;
+        }
+    }
+    c->qx_parent[k] = (uint32_t)parent; c->nqx = k + 1;   // 先登记：池已建，完成 / 放弃时都要销毁
+    vkCmdResetQueryPool(c->cb, c->qx[k / QX_PER_POOL], k % QX_PER_POOL, 1);
+    return k + 1;
+}
+// 续段第二步（新通道开好后）：在续段槽上接着计，对外仍是父槽在开着
+static void occl_split_resume(struct nvn_gpu_cmd_s *c, int32_t parent, uint32_t slot1) {
+    vkCmdBeginQuery(c->cb, c->qx[(slot1 - 1) / QX_PER_POOL], (slot1 - 1) % QX_PER_POOL, occl_flags());
+    c->q_active = parent; c->qx_cur = slot1;
+}
+
 void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c) return;
     if (!c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_end 时不在通道里"); return; }
-    if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->qpool, (uint32_t)c->q_active); c->q_active = -1; }   // 查询不跨通道
+    occl_end(c);   // 查询不跨通道
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
     c->in_pass = 0;
@@ -7353,14 +7404,10 @@ void nvn_gpu_occlusion(nvn_gpu_cmd ch, int32_t slot) {
     if (!c->in_pass || !c->pass_occl) { set_sticky(c, NVN_GPU_E_ORDER, "遮挡查询只能在声明了 occlusion 的通道里开关"); return; }
     if (!c->qpool) { set_sticky(c, NVN_GPU_E_ARG, "遮挡查询：本段开段时没声明 occlusion_slots"); return; }
     if (slot >= 0 && ((uint32_t)slot >= c->qcount || c->q_used[slot])) { set_sticky(c, NVN_GPU_E_ARG, "遮挡查询槽 %d 越界（本段 %u 槽）或本段已用过", slot, c->qcount); return; }
-    if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->qpool, (uint32_t)c->q_active); c->q_active = -1; }
+    occl_end(c);
     if (slot < 0) return;
-    // 开关 debug.s2a.nvk_occl_fast（缺省 0 = 照能力位用 PRECISE 精确计数）：1 = 不带 PRECISE，走显卡的快速（可能非精确）计数。
-    // 精确计数在部分移动 GPU 上要逐个样本过一遍，本款每帧 400 多个遮挡查询、全在热通道里；NVN 的语义要精确值，先用读数看差多少。
-    static int fast = -1;
-    if (fast < 0) fast = nvn_plat_flag("nvk_occl_fast", 0) != 0;
     OC(OC_QUERY);
-    vkCmdBeginQuery(c->cb, c->qpool, (uint32_t)slot, g.dev->core_features.occlusionQueryPrecise && !fast ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    vkCmdBeginQuery(c->cb, c->qpool, (uint32_t)slot, occl_flags());
     c->q_active = slot; c->q_used[slot] = 1; if ((uint32_t)slot + 1 > c->qmax_used) c->qmax_used = (uint32_t)slot + 1;
 }
 

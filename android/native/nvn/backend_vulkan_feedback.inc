@@ -126,8 +126,9 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     return rc_is(c->sticky, NVN_GPU_OK);
 }
 static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int copy) {
-    // 同一 occlusion query 不能跨 VkRenderPass；不截断查询后假报成功。
-    if (c->q_active >= 0) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback transition inside active occlusion query"); return 0; }
+    // 同一 occlusion query 不能跨 VkRenderPass：断通道前结束它（pass_end 做），新通道开好后在续段槽上接着计，
+    // 完成时续段读数加回父槽（occl_split_*）。断开期间只有拷贝 / 屏障，没有绘制，样本数相加与不断开等价。
+    const int32_t q = c->q_active;
     if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[2], 1, __ATOMIC_RELAXED);
     nvn_gpu_pass_desc d = c->pass_desc;
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) {
@@ -135,11 +136,14 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     }
     if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
     if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
-    nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始
+    nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始（开着的查询在这里结束）
+    const uint32_t qx = q >= 0 ? occl_split_reserve(c, q) : 0;   // 续段槽的重置要在通道外
+    if (q >= 0 && !qx) return 0;
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (!feedback_make(c, f)) return 0;
     c->feedback_read_mask = read_mask;
     nvn_gpu_pass_begin(c, &d);
+    if (qx && c->in_pass && rc_is(c->sticky, NVN_GPU_OK)) occl_split_resume(c, q, qx);
     return rc_is(c->sticky, NVN_GPU_OK);
 }
 static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
